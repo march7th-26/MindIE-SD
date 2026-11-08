@@ -12,12 +12,15 @@
 
 import math
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
+
 import torch
 from einops import rearrange
-from .. import _custom_ops as ops
+
 from ...utils.exception import ParametersInvalid
 from ...utils.get_platform import is_a5_device
-
+from .. import _custom_ops as ops
+from .ref_sparse_mask import RefDenseBlocks, apply_ref_mask, build_ref_plan
 
 _A5_RF_V2_UNSUPPORTED_MSG = (
     "sparse_flash_attn_rf_v2 (rain_fusion_attention) is not supported on A5 devices. "
@@ -423,13 +426,9 @@ def _normalize_video_spans(video_spans, sequence_len):
             start = int(span["start"])
             shape = tuple(int(dim) for dim in span["latent_shape"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ParametersInvalid(
-                f"video_spans[{index}] requires integer start and latent_shape=[T,H,W]."
-            ) from exc
+            raise ParametersInvalid(f"video_spans[{index}] requires integer start and latent_shape=[T,H,W].") from exc
         if len(shape) != 3 or any(dim <= 0 for dim in shape):
-            raise ParametersInvalid(
-                f"video_spans[{index}].latent_shape must contain three positive integers."
-            )
+            raise ParametersInvalid(f"video_spans[{index}].latent_shape must contain three positive integers.")
         length = math.prod(shape)
         if start < previous_end or start + length > sequence_len:
             raise ParametersInvalid(
@@ -479,9 +478,7 @@ def _multi_span_permutation(spans, sequence_len, pool_size, input_layout, device
         if position % pool_size:
             raise AssertionError("multi-span packing lost block alignment")
         clip_block = position // pool_size
-        first_frame_blocks.update(
-            range(clip_block, clip_block + math.ceil((shape[1] * shape[2]) / pool_size))
-        )
+        first_frame_blocks.update(range(clip_block, clip_block + math.ceil((shape[1] * shape[2]) / pool_size)))
         parts.append(_span_rearranged_indices(start, shape, input_layout, device))
         position += length
         if clip_index != len(spans) - 1 and position % pool_size:
@@ -529,6 +526,8 @@ def get_multi_span_blockwise_mask(
         retained_idx = torch.tensor(retained, device=mask.device, dtype=torch.long)
         mask[:, :, retained_idx, :] = True
         mask[:, :, :, retained_idx] = True
+    if isinstance(dense_blocks, RefDenseBlocks):
+        mask = apply_ref_mask(mask, scores, dense_blocks.ref_plan, dense_blocks.keep_ratio)
     if return_binary:
         return mask.to(torch.int8)
     select_idx = get_mask_index(mask)[0].transpose(0, 1)
@@ -539,17 +538,21 @@ def get_multi_span_blockwise_mask(
 def do_multi_span_tensor_rearrange_pooling(query, key, value, video_spans, pool_size, input_layout):
     """Prepare one global rf_v2 call for an unpadded packed video sequence."""
     sequence_len = _sequence_length(query, input_layout)
-    if (
-        _sequence_length(key, input_layout) != sequence_len
-        or _sequence_length(value, input_layout) != sequence_len
-    ):
-        raise ParametersInvalid(
-            "Q, K, and V must have identical sequence lengths in rf_v2 multi-video mode."
-        )
+    if _sequence_length(key, input_layout) != sequence_len or _sequence_length(value, input_layout) != sequence_len:
+        raise ParametersInvalid("Q, K, and V must have identical sequence lengths in rf_v2 multi-video mode.")
     spans = _normalize_video_spans(video_spans, sequence_len)
     permutation, inverse, dense_blocks, first_frame_blocks = _multi_span_permutation(
         spans, sequence_len, pool_size, input_layout, query.device
     )
+    ratio = float(video_spans[0].get('_ref_keep_ratio', 1.0))
+    if ratio < 1:
+        images = tuple(tuple(x) for x in video_spans[0].get('_ref_images', ()))
+        positions = tuple(tuple(x) for x in video_spans[0].get('_ref_image_positions', ()))
+        targets = tuple(tuple(x) for x in video_spans[0].get('_ref_targets', ()))
+        plan = _ref_plan_cached(
+            tuple(spans), sequence_len, pool_size, input_layout, images, positions, targets, str(query.device)
+        )
+        dense_blocks = RefDenseBlocks(dense_blocks, plan, ratio)
     q_rf = _index_sequence(query, permutation, input_layout)
     k_rf = _index_sequence(key, permutation, input_layout)
     v_rf = _index_sequence(value, permutation, input_layout)
@@ -606,3 +609,20 @@ def rain_fusion_attention(
     )
 
     return out
+
+
+@lru_cache(maxsize=32)
+def _ref_plan_cached(spans, length, block_size, layout, images, positions, targets, device):
+    perm, _, dense, first = _multi_span_permutation(spans, length, block_size, layout, 'cpu')
+    plan = build_ref_plan(perm.tolist(), images, targets, block_size, dense | first, positions)
+    print(
+        'REF_BLOCK_FULL_PLAN',
+        {
+            "images": len(plan[0]),
+            "candidates": [len(x) for x in plan[0]],
+            "target_rows": len(plan[1]),
+            "protected": len(dense | first),
+        },
+        flush=True,
+    )
+    return plan
